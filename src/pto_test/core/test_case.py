@@ -8,9 +8,12 @@ executed on both simulation and hardware platforms.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union, TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from pypto.ir.pass_manager import OptimizationStrategy
 
 
 class DataType(Enum):
@@ -105,6 +108,17 @@ class TestConfig:
         rtol: Relative tolerance for result comparison.
         block_dim: Number of blocks for parallel execution.
         aicpu_thread_num: Number of AICPU scheduler threads.
+        save_kernels: If True, save generated kernels to persistent directory.
+        save_kernels_dir: Directory to save generated kernels.
+                          If None, defaults to build/outputs/output_{timestamp}/
+                          Structure:
+                            {save_dir}/{test_name}/
+                              ├── kernels/aiv/
+                              ├── kernels/orchestration/
+                              ├── pass_dump/  (if dump_passes=True)
+                              └── metadata.json
+        dump_passes: If True, dump intermediate IR after each pass.
+        codegen_only: If True, only generate code without executing runtime.
     """
 
     platform: str = "a2a3sim"
@@ -113,6 +127,10 @@ class TestConfig:
     rtol: float = 1e-5
     block_dim: int = 1
     aicpu_thread_num: int = 1
+    save_kernels: bool = False
+    save_kernels_dir: Optional[str] = None
+    dump_passes: bool = False
+    codegen_only: bool = False
 
     def __post_init__(self):
         if self.platform not in ("a2a3sim", "a2a3"):
@@ -162,8 +180,11 @@ class PTOTestCase(ABC):
         - get_name(): Return the test case name
         - define_tensors(): Define input/output tensors
         - get_program(): Return a @pl.program class or ir.Program
-        - get_orchestration(): Return orchestration C++ code for Simpler
-        - compute_expected(): Compute expected results with NumPy
+        - compute_expected(): Compute expected results with NumPy (in-place)
+
+    Optional overrides:
+        - get_strategy(): Return optimization strategy (default: Default)
+        - get_orchestration(): Return custom orchestration C++ (default: auto-generated)
 
     Example:
         import pypto.language as pl
@@ -192,17 +213,10 @@ class PTOTestCase(ABC):
                         pl.op.block.store(tile_c, 0, 0, 128, 128, c)
                 return TileAddProgram
 
-            def get_orchestration(self):
-                return '''
-                #include "runtime.h"
-                extern "C" int build_test_graph(Runtime* runtime, uint64_t* args, int arg_count) {
-                    // ... orchestration code ...
-                    return 0;
-                }
-                '''
+            # get_orchestration() not implemented - auto-generated!
 
-            def compute_expected(self, inputs):
-                return {"c": inputs["a"] + inputs["b"]}
+            def compute_expected(self, tensors, params=None):
+                tensors["c"][:] = tensors["a"] + tensors["b"]
     """
 
     def __init__(self, config: Optional[TestConfig] = None):
@@ -237,27 +251,56 @@ class PTOTestCase(ABC):
         """
         pass
 
-    @abstractmethod
-    def get_orchestration(self) -> str:
+    def get_strategy(self) -> "OptimizationStrategy":
+        """Return the optimization strategy for the pass pipeline.
+
+        Override to use a different strategy (e.g., PTOAS).
+        Default is OptimizationStrategy.Default.
+
+        Returns:
+            OptimizationStrategy enum value.
+        """
+        from pypto.ir.pass_manager import OptimizationStrategy
+        return OptimizationStrategy.Default
+
+    def get_orchestration(self) -> Optional[str]:
         """Return orchestration C++ code for Simpler runtime.
+
+        Override to provide custom orchestration for complex multi-kernel
+        test cases. Return None to use auto-generated orchestration.
 
         The orchestration function must be named 'build_test_graph' and have
         the signature: int build_test_graph(Runtime* runtime, uint64_t* args, int arg_count)
 
         Returns:
-            C++ source code string for the orchestration function.
+            C++ source code string for the orchestration function,
+            or None for auto-generation.
         """
-        pass
+        return None
 
     @abstractmethod
-    def compute_expected(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """Compute expected outputs using NumPy.
+    def compute_expected(self, tensors: Dict[str, np.ndarray], params: Optional[Dict[str, Any]] = None) -> None:
+        """Compute expected outputs using NumPy (modifies tensors in-place).
+
+        This method should compute the expected outputs and write them directly
+        to the output tensors in the tensors dict. This signature matches the
+        compute_golden() function in generated golden.py files.
 
         Args:
-            inputs: Dict mapping input tensor names to numpy arrays.
+            tensors: Dict mapping all tensor names (inputs and outputs) to numpy arrays.
+                     Modify output tensors in-place.
+            params: Optional dict of parameters (for parameterized tests).
 
-        Returns:
-            Dict mapping output tensor names to expected numpy arrays.
+        Example:
+            def compute_expected(self, tensors, params=None):
+                # Simple computation
+                tensors["c"][:] = tensors["a"] + tensors["b"]
+
+            def compute_expected(self, tensors, params=None):
+                # Complex multi-step computation
+                temp = np.exp(tensors["a"])
+                result = np.maximum(temp * tensors["b"], 0)
+                tensors["output"][:] = np.sqrt(result)
         """
         pass
 

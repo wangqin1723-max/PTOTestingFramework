@@ -7,10 +7,17 @@ from pathlib import Path
 
 import pytest
 
-# Add src to path
-_SRC_PATH = Path(__file__).parent.parent / "src"
-if str(_SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(_SRC_PATH))
+# Add src and 3rdparty paths
+_FRAMEWORK_ROOT = Path(__file__).parent.parent
+_SRC_PATH = _FRAMEWORK_ROOT / "src"
+_PYPTO_ROOT = _FRAMEWORK_ROOT / "3rdparty" / "pypto" / "python"
+_SIMPLER_ROOT = _FRAMEWORK_ROOT / "3rdparty" / "simpler"
+_SIMPLER_PYTHON = _SIMPLER_ROOT / "python"
+_SIMPLER_SCRIPTS = _SIMPLER_ROOT / "examples" / "scripts"
+
+for path in [_SRC_PATH, _PYPTO_ROOT, _SIMPLER_PYTHON, _SIMPLER_SCRIPTS]:
+    if path.exists() and str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
 from pto_test.core.test_case import TestConfig
 from pto_test.core.test_runner import TestRunner
@@ -33,6 +40,13 @@ def pytest_addoption(parser):
         help="Device ID for hardware tests (default: 0)",
     )
     parser.addoption(
+        "--strategy",
+        action="store",
+        default="Default",
+        choices=["Default", "PTOAS"],
+        help="Optimization strategy for PyPTO pass pipeline (default: Default)",
+    )
+    parser.addoption(
         "--fuzz-count",
         action="store",
         default=10,
@@ -46,21 +60,73 @@ def pytest_addoption(parser):
         type=int,
         help="Random seed for fuzz tests (default: random)",
     )
-
-
-@pytest.fixture
-def test_config(request) -> TestConfig:
-    """Fixture providing test configuration from command line options."""
-    return TestConfig(
-        platform=request.config.getoption("--platform"),
-        device_id=request.config.getoption("--device"),
+    parser.addoption(
+        "--kernels-dir",
+        action="store",
+        default=None,
+        help="Output directory for generated kernels (default: build/outputs/output_{timestamp}/)",
+    )
+    parser.addoption(
+        "--save-kernels",
+        action="store_true",
+        default=False,
+        help="Save generated kernels to --kernels-dir (default: False)",
+    )
+    parser.addoption(
+        "--dump-passes",
+        action="store_true",
+        default=False,
+        help="Dump intermediate IR after each pass (default: False)",
+    )
+    parser.addoption(
+        "--codegen-only",
+        action="store_true",
+        default=False,
+        help="Only generate code, skip runtime execution (default: False)",
     )
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
+def test_config(request) -> TestConfig:
+    """Session-scoped fixture providing test configuration from CLI options.
+
+    Session scope means the config is created once and shared across all tests,
+    which is appropriate since CLI options don't change during a test run.
+    """
+    # Determine save_kernels_dir
+    save_kernels = request.config.getoption("--save-kernels")
+    save_kernels_dir = None
+    if save_kernels:
+        kernels_dir = request.config.getoption("--kernels-dir")
+        # If --kernels-dir is specified, use it; otherwise None will use session output directory
+        save_kernels_dir = kernels_dir
+
+    return TestConfig(
+        platform=request.config.getoption("--platform"),
+        device_id=request.config.getoption("--device"),
+        save_kernels=save_kernels,
+        save_kernels_dir=save_kernels_dir,
+        dump_passes=request.config.getoption("--dump-passes"),
+        codegen_only=request.config.getoption("--codegen-only"),
+    )
+
+
+@pytest.fixture(scope="session")
 def test_runner(test_config) -> TestRunner:
-    """Fixture providing a test runner instance."""
+    """Session-scoped fixture providing a test runner instance.
+
+    Session scope is used because:
+    1. The runner caches compiled runtime binaries
+    2. Building the runtime takes significant time
+    3. The same runner can be reused across all tests
+    """
     return TestRunner(test_config)
+
+
+@pytest.fixture
+def optimization_strategy(request) -> str:
+    """Fixture providing the optimization strategy from CLI options."""
+    return request.config.getoption("--strategy")
 
 
 @pytest.fixture
@@ -97,7 +163,7 @@ def tensor_shape(request):
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line(
-        "markers", "hardware: mark test as requiring hardware"
+        "markers", "hardware: mark test as requiring hardware (--platform=a2a3)"
     )
     config.addinivalue_line(
         "markers", "slow: mark test as slow"

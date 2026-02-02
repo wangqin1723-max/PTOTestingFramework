@@ -3,44 +3,67 @@ Test runner for executing PTO test cases.
 
 Orchestrates the full test execution pipeline:
 1. Get program from test case (@pl.program or IRBuilder)
-2. Generate kernel code via PyPTO (PassManager → CceCodegen)
-3. Compile kernel and orchestration
-4. Execute on Simpler runtime
-5. Validate results
+2. Generate kernel code via PyPTO (PassManager -> CceCodegen)
+3. Generate orchestration code (auto or custom)
+4. Generate kernel_config.py and golden.py
+5. Execute via simpler's CodeRunner
+6. Validate results
 """
 
+import json
+import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional
 
-import numpy as np
-
-from pto_test.core.test_case import PTOTestCase, TestConfig, TestResult, TensorSpec
-from pto_test.core.validators import ResultValidator
+from pto_test.core.test_case import PTOTestCase, TestConfig, TestResult
 
 # Add pypto and simpler to path
 _FRAMEWORK_ROOT = Path(__file__).parent.parent.parent.parent
 _PYPTO_ROOT = _FRAMEWORK_ROOT / "3rdparty" / "pypto" / "python"
 _SIMPLER_ROOT = _FRAMEWORK_ROOT / "3rdparty" / "simpler"
 _SIMPLER_PYTHON = _SIMPLER_ROOT / "python"
+_SIMPLER_SCRIPTS = _SIMPLER_ROOT / "examples" / "scripts"
 
-if _PYPTO_ROOT.exists() and str(_PYPTO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PYPTO_ROOT))
+for path in [_PYPTO_ROOT, _SIMPLER_PYTHON, _SIMPLER_SCRIPTS]:
+    if path.exists() and str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-if _SIMPLER_PYTHON.exists() and str(_SIMPLER_PYTHON) not in sys.path:
-    sys.path.insert(0, str(_SIMPLER_PYTHON))
+# Session-level output directory (shared across all tests in a pytest session)
+_SESSION_OUTPUT_DIR = None
+
+
+def _get_session_output_dir() -> Path:
+    """Get or create session-level output directory with timestamp.
+
+    Returns:
+        Path to the session output directory (build/outputs/output_{timestamp}/).
+    """
+    global _SESSION_OUTPUT_DIR
+    if _SESSION_OUTPUT_DIR is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_base = _FRAMEWORK_ROOT / "build" / "outputs"
+        _SESSION_OUTPUT_DIR = output_base / f"output_{timestamp}"
+        _SESSION_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return _SESSION_OUTPUT_DIR
 
 
 class TestRunner:
-    """Executes PTO test cases on Simpler runtime.
+    """Executes PTO test cases via simpler's CodeRunner.
 
-    Handles the complete test execution pipeline including:
-    - Kernel code generation via PyPTO
-    - Compilation
-    - Runtime execution
-    - Result validation
+    This runner integrates with simpler's CodeRunner to execute tests:
+    1. Generate kernel C++ from PyPTO program via codegen module
+    2. Generate orchestration C++ (auto or custom)
+    3. Generate kernel_config.py and golden.py
+    4. Use CodeRunner to compile, execute, and validate
+
+    Example:
+        runner = TestRunner(TestConfig(platform="a2a3sim"))
+        result = runner.run(my_test_case)
+        assert result.passed
     """
 
     def __init__(self, config: Optional[TestConfig] = None):
@@ -50,52 +73,7 @@ class TestRunner:
             config: Test configuration. If None, uses default config.
         """
         self.config = config or TestConfig()
-        self._runtime_builder = None
-        self._pto_compiler = None
-        self._host_binary = None
-        self._aicpu_binary = None
-        self._aicore_binary = None
         self._initialized = False
-        self._pass_manager = None
-        self._codegen = None
-
-    def _lazy_init(self):
-        """Lazy initialization of runtime builder and compiler."""
-        if self._initialized:
-            return
-
-        try:
-            from runtime_builder import RuntimeBuilder
-        except ImportError as e:
-            raise ImportError(
-                f"Cannot import Simpler runtime builder: {e}\n"
-                f"Make sure simpler is properly installed at {_SIMPLER_ROOT}"
-            )
-
-        self._runtime_builder = RuntimeBuilder(platform=self.config.platform)
-        self._pto_compiler = self._runtime_builder.get_pto_compiler()
-
-        # Build runtime binaries once
-        print(f"Building runtime for platform: {self.config.platform}")
-        self._host_binary, self._aicpu_binary, self._aicore_binary = (
-            self._runtime_builder.build("host_build_graph")
-        )
-
-        self._initialized = True
-
-    def _get_pass_manager(self):
-        """Get or create PassManager with XPlatform strategy."""
-        if self._pass_manager is None:
-            from pypto.ir.pass_manager import PassManager, OptimizationStrategy
-            self._pass_manager = PassManager.get_strategy(OptimizationStrategy.XPlatform)
-        return self._pass_manager
-
-    def _get_codegen(self):
-        """Get or create CceCodegen instance."""
-        if self._codegen is None:
-            from pypto.pypto_core import codegen
-            self._codegen = codegen.CceCodegen()
-        return self._codegen
 
     def run(self, test_case: PTOTestCase) -> TestResult:
         """Run a test case and return results.
@@ -109,10 +87,32 @@ class TestRunner:
         start_time = time.time()
         test_name = test_case.get_name()
 
-        try:
-            self._lazy_init()
+        # Determine work directory based on save_kernels configuration
+        if self.config.save_kernels:
+            # Always save mode: use persistent directory directly
+            if self.config.save_kernels_dir:
+                work_dir = Path(self.config.save_kernels_dir) / test_name
+            else:
+                session_dir = _get_session_output_dir()
+                work_dir = session_dir / test_name
+            work_dir.mkdir(parents=True, exist_ok=True)
+            use_temp = False
+        else:
+            # Temporary mode: use temp directory for execution
+            work_dir = Path(tempfile.mkdtemp(prefix=f"pto_test_{test_name}_"))
+            use_temp = True
 
-            # 1. Get program from test case
+        try:
+            # Import codegen modules
+            from pto_test.codegen.kernel_generator import KernelGenerator
+            from pto_test.codegen.orch_generator import OrchGenerator
+            from pto_test.codegen.config_generator import ConfigGenerator
+            from pto_test.codegen.golden_generator import GoldenGenerator
+
+            kernels_dir = work_dir / "kernels"
+            kernels_dir.mkdir(parents=True, exist_ok=True)
+
+            # 1. Generate kernel C++ files
             program = test_case.get_program()
             if program is None:
                 raise ValueError(
@@ -120,219 +120,135 @@ class TestRunner:
                     "to return a @pl.program class or ir.Program"
                 )
 
-            # 2. Generate kernel code via PyPTO pipeline
-            kernel_code = self._generate_kernel(program)
+            strategy = test_case.get_strategy()
+            kernel_gen = KernelGenerator(strategy=strategy)
+            kernel_configs = kernel_gen.generate(
+                program,
+                kernels_dir,
+                dump_passes=self.config.dump_passes,
+            )
 
-            # 3. Compile kernel
-            kernel_binary = self._compile_kernel(kernel_code, test_name)
+            if not kernel_configs:
+                raise ValueError(f"No kernels generated for {test_name}")
 
-            # 4. Get and compile orchestration
+            # Move pass_dump to same level as metadata.json if it exists
+            pass_dump_in_kernels = kernels_dir / "pass_dump"
+            if pass_dump_in_kernels.exists():
+                pass_dump_target = work_dir / "pass_dump"
+                # Remove target if it exists to avoid nested directories
+                if pass_dump_target.exists():
+                    shutil.rmtree(pass_dump_target)
+                shutil.move(str(pass_dump_in_kernels), str(pass_dump_target))
+
+            # 2. Generate orchestration C++ file
+            orch_dir = kernels_dir / "orchestration"
+            orch_dir.mkdir()
+
             orch_code = test_case.get_orchestration()
             if orch_code is None:
-                raise ValueError(
-                    f"Test case {test_name} must implement get_orchestration() "
-                    "to return orchestration C++ code"
+                # Auto-generate orchestration
+                orch_gen = OrchGenerator()
+                orch_code = orch_gen.generate(
+                    test_case.tensor_specs, kernel_configs
                 )
-            orch_binary = self._compile_orchestration(orch_code)
 
-            # 5. Prepare test data
-            inputs = test_case.prepare_inputs()
-            outputs = test_case.prepare_outputs()
+            orch_path = orch_dir / "orch.cpp"
+            orch_path.write_text(orch_code)
 
-            # 6. Execute on runtime
-            actual_outputs = self._execute(
-                kernel_binary,
-                orch_binary,
-                inputs,
-                outputs,
-                test_case,
+            # 3. Generate kernel_config.py
+            config_gen = ConfigGenerator()
+            config_gen.write(
+                kernels_dir,
+                kernel_configs,
+                str(orch_path),
+                "build_test_graph",
             )
 
-            # 7. Validate results
-            expected = test_case.compute_expected(inputs)
-            validator = ResultValidator(
-                atol=self.config.atol,
-                rtol=self.config.rtol,
+            # 4. Generate golden.py with inline compute logic
+            golden_path = kernels_dir / "golden.py"
+            golden_gen = GoldenGenerator()
+            golden_gen.write(test_case, golden_path)
+
+            # 5. Write metadata.json if saving
+            if self.config.save_kernels:
+                metadata = {
+                    "test_name": test_name,
+                    "strategy": str(strategy),
+                    "dump_passes": self.config.dump_passes,
+                    "timestamp": datetime.now().isoformat(),
+                    "kernels": [
+                        {
+                            "func_id": k["func_id"],
+                            "function_name": k.get("function_name", "unknown"),
+                            "core_type": k["core_type"],
+                            "source": str(Path("kernels") / Path(k["source"]).relative_to(kernels_dir)),
+                        }
+                        for k in kernel_configs
+                    ],
+                }
+                (work_dir / "metadata.json").write_text(
+                    json.dumps(metadata, indent=2, default=str)
+                )
+
+            # 6. Execute via CodeRunner (skip if codegen_only)
+            if self.config.codegen_only:
+                # Codegen-only mode: skip runtime execution
+                return TestResult(
+                    passed=True,
+                    test_name=test_name,
+                    execution_time=time.time() - start_time,
+                )
+
+            self._execute_with_code_runner(
+                kernels_dir, golden_path, test_name
             )
 
-            result = validator.validate(expected, actual_outputs, test_name)
-            result.execution_time = time.time() - start_time
-            return result
-
-        except Exception as e:
             return TestResult(
-                passed=False,
+                passed=True,
                 test_name=test_name,
-                error=str(e),
                 execution_time=time.time() - start_time,
             )
 
-    def _generate_kernel(self, program: Any) -> str:
-        """Generate kernel code using PyPTO pipeline.
-
-        Pipeline: Program → PassManager (XPlatform) → CceCodegen → C++
-
-        Args:
-            program: PyPTO Program (from @pl.program or ir.Program).
-
-        Returns:
-            Generated C++ kernel code string.
-        """
-        # Apply passes
-        pm = self._get_pass_manager()
-        transformed = pm.run_passes(program)
-
-        # Generate code for each function
-        cg = self._get_codegen()
-        code_parts = []
-        for func_name, func in transformed.functions.items():
-            code = cg.Generate(func)
-            code_parts.append(code)
-
-        return "\n\n".join(code_parts)
-
-    def _compile_kernel(self, code: str, kernel_name: str) -> bytes:
-        """Compile kernel code to binary.
-
-        Args:
-            code: C++ kernel source code.
-            kernel_name: Name of the kernel function.
-
-        Returns:
-            Binary data (extracted .text section).
-        """
-        from elf_parser import extract_text_section
-
-        # Write code to temporary file
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.cpp', delete=False
-        ) as f:
-            f.write(code)
-            source_path = f.name
-
-        try:
-            # Compile using PTO compiler
-            kernel_o = self._pto_compiler.compile_incore(
-                source_path,
-                core_type="aiv",
-                pto_isa_root=str(_FRAMEWORK_ROOT / "3rdparty" / "pto-isa"),
-            )
-
-            # Extract .text section
-            return extract_text_section(kernel_o)
-        finally:
-            Path(source_path).unlink(missing_ok=True)
-
-    def _compile_orchestration(self, code: str) -> bytes:
-        """Compile orchestration code to shared library.
-
-        Args:
-            code: C++ orchestration source code.
-
-        Returns:
-            Shared library binary data.
-        """
-        # Write code to temporary file
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.cpp', delete=False
-        ) as f:
-            f.write(code)
-            source_path = f.name
-
-        try:
-            # Get include directories
-            runtime_include = (
-                _SIMPLER_ROOT / "src" / "runtime" / "host_build_graph" / "runtime"
-            )
-            include_dirs = [str(runtime_include)]
-            include_dirs.extend(self._pto_compiler.get_platform_include_dirs())
-
-            # Compile
-            return self._pto_compiler.compile_orchestration(
-                source_path,
-                extra_include_dirs=include_dirs,
+        except Exception as e:
+            import traceback
+            return TestResult(
+                passed=False,
+                test_name=test_name,
+                error=f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+                execution_time=time.time() - start_time,
             )
         finally:
-            Path(source_path).unlink(missing_ok=True)
+            # Clean up temporary directory if used
+            if use_temp and work_dir.exists():
+                shutil.rmtree(work_dir)
 
-    def _execute(
+    def _execute_with_code_runner(
         self,
-        kernel_binary: bytes,
-        orch_binary: bytes,
-        inputs: Dict[str, np.ndarray],
-        outputs: Dict[str, np.ndarray],
-        test_case: PTOTestCase,
-    ) -> Dict[str, np.ndarray]:
-        """Execute test on Simpler runtime.
+        kernels_dir: Path,
+        golden_path: Path,
+        test_name: str,
+    ) -> None:
+        """Execute test using simpler's CodeRunner.
 
         Args:
-            kernel_binary: Compiled kernel binary.
-            orch_binary: Compiled orchestration binary.
-            inputs: Input arrays.
-            outputs: Output arrays (will be modified in place).
-            test_case: Test case for tensor specifications.
+            kernels_dir: Path to directory with kernel_config.py
+            golden_path: Path to golden.py
+            test_name: Name of the test (for logging)
 
-        Returns:
-            Dict of output arrays with computed values.
+        Raises:
+            Exception: If test execution fails
         """
-        from bindings import (
-            bind_host_binary,
-            register_kernel,
-            set_device,
-            launch_runtime,
-        )
+        from code_runner import CodeRunner
 
-        # Load runtime
-        Runtime = bind_host_binary(self._host_binary)
-
-        # Set device
-        set_device(self.config.device_id)
-
-        # Register kernel
-        register_kernel(0, kernel_binary)
-
-        # Build func_args
-        # Format: [ptr1, ptr2, ..., size1, size2, ..., total_size]
-        func_args = []
-        tensor_specs = test_case.tensor_specs
-
-        # Add pointers
-        for spec in tensor_specs:
-            if spec.is_output:
-                arr = outputs[spec.name]
-            else:
-                arr = inputs[spec.name]
-            func_args.append(arr.ctypes.data)
-
-        # Add sizes
-        for spec in tensor_specs:
-            if spec.is_output:
-                arr = outputs[spec.name]
-            else:
-                arr = inputs[spec.name]
-            func_args.append(arr.nbytes)
-
-        # Add total element count (use first tensor's size)
-        func_args.append(tensor_specs[0].size)
-
-        # Create and initialize runtime
-        runtime = Runtime()
-        runtime.initialize(orch_binary, "build_test_graph", func_args)
-
-        # Execute
-        launch_runtime(
-            runtime,
-            aicpu_thread_num=self.config.aicpu_thread_num,
-            block_dim=self.config.block_dim,
+        runner = CodeRunner(
+            kernels_dir=str(kernels_dir),
+            golden_path=str(golden_path),
+            platform=self.config.platform,
             device_id=self.config.device_id,
-            aicpu_binary=self._aicpu_binary,
-            aicore_binary=self._aicore_binary,
         )
 
-        # Finalize (copies results back)
-        runtime.finalize()
-
-        return outputs
+        # Run the test
+        runner.run()
 
 
 class TestSuite:
@@ -350,26 +266,12 @@ class TestSuite:
         self._test_cases: list = []
 
     def add_test(self, test_case: PTOTestCase) -> "TestSuite":
-        """Add a test case to the suite.
-
-        Args:
-            test_case: Test case to add.
-
-        Returns:
-            Self for chaining.
-        """
+        """Add a test case to the suite."""
         self._test_cases.append(test_case)
         return self
 
     def run_all(self, runner: Optional[TestRunner] = None) -> Dict[str, TestResult]:
-        """Run all test cases in the suite.
-
-        Args:
-            runner: Test runner to use. If None, creates one.
-
-        Returns:
-            Dict mapping test names to results.
-        """
+        """Run all test cases in the suite."""
         if runner is None:
             runner = TestRunner(self.config)
 
@@ -382,14 +284,7 @@ class TestSuite:
         return results
 
     def summary(self, results: Dict[str, TestResult]) -> str:
-        """Generate summary of test results.
-
-        Args:
-            results: Results from run_all().
-
-        Returns:
-            Summary string.
-        """
+        """Generate summary of test results."""
         passed = sum(1 for r in results.values() if r.passed)
         total = len(results)
         failed = total - passed

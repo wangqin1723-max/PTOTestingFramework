@@ -2,11 +2,12 @@
 Tests for elementwise operations using PyPTO frontend.
 
 Tests tile-level binary operations like add, sub, mul, div.
+These tests use the simplified pattern where orchestration is auto-generated.
 """
 
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, List
 
 import numpy as np
 import pytest
@@ -21,7 +22,18 @@ if _PYPTO_ROOT.exists() and str(_PYPTO_ROOT) not in sys.path:
 
 
 class TestTileAdd(PTOTestCase):
-    """Test case for tile element-wise addition."""
+    """Test case for tile element-wise addition.
+
+    This test case demonstrates the simplified pattern:
+    - No get_orchestration() override needed (auto-generated)
+    - Just implement get_program() and compute_expected()
+
+    Note: PyPTO requires shape dimensions to be compile-time constants in type
+    annotations. The shape is fixed at 128x128 for this test case.
+    """
+
+    ROWS = 128
+    COLS = 128
 
     def __init__(self, rows: int = 128, cols: int = 128, **kwargs):
         super().__init__(**kwargs)
@@ -41,75 +53,29 @@ class TestTileAdd(PTOTestCase):
     def get_program(self) -> Any:
         import pypto.language as pl
 
-        rows, cols = self.rows, self.cols
+        # PyPTO parser requires constant shape dimensions in type annotations.
+        # Use literal values throughout.
 
         @pl.program
         class TileAddProgram:
             @pl.function
             def tile_add(
                 self,
-                a: pl.Tensor[[rows, cols], pl.FP32],
-                b: pl.Tensor[[rows, cols], pl.FP32],
-                c: pl.Tensor[[rows, cols], pl.FP32],
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                c: pl.Tensor[[128, 128], pl.FP32],
             ):
-                tile_a = pl.op.block.load(a, 0, 0, rows, cols)
-                tile_b = pl.op.block.load(b, 0, 0, rows, cols)
+                tile_a = pl.op.block.load(a, 0, 0, 128, 128)
+                tile_b = pl.op.block.load(b, 0, 0, 128, 128)
                 tile_c = pl.op.block.add(tile_a, tile_b)
-                pl.op.block.store(tile_c, 0, 0, rows, cols, c)
+                pl.op.block.store(tile_c, 0, 0, 128, 128, c)
 
         return TileAddProgram
 
-    def get_orchestration(self) -> str:
-        return f'''
-#include "runtime.h"
-#include <iostream>
+    # NOTE: get_orchestration() is NOT overridden - auto-generated!
 
-extern "C" {{
-
-int build_test_graph(Runtime* runtime, uint64_t* args, int arg_count) {{
-    // Extract arguments: [ptr_a, ptr_b, ptr_c, size_a, size_b, size_c, total_size]
-    void* host_a = reinterpret_cast<void*>(args[0]);
-    void* host_b = reinterpret_cast<void*>(args[1]);
-    void* host_c = reinterpret_cast<void*>(args[2]);
-    size_t size_a = static_cast<size_t>(args[3]);
-    size_t size_b = static_cast<size_t>(args[4]);
-    size_t size_c = static_cast<size_t>(args[5]);
-    int SIZE = static_cast<int>(args[6]);
-
-    std::cout << "\\n=== build_test_graph: Creating Task Runtime ===\\n";
-
-    // Allocate device memory
-    void* dev_a = runtime->host_api.device_malloc(size_a);
-    void* dev_b = runtime->host_api.device_malloc(size_b);
-    void* dev_c = runtime->host_api.device_malloc(size_c);
-
-    // Copy inputs to device
-    runtime->host_api.copy_to_device(dev_a, host_a, size_a);
-    runtime->host_api.copy_to_device(dev_b, host_b, size_b);
-
-    // Register output for copy-back
-    runtime->record_tensor_pair(host_c, dev_c, size_c);
-
-    // Build task args: [ptr_a, ptr_b, ptr_c, SIZE]
-    uint64_t task_args[4];
-    task_args[0] = reinterpret_cast<uint64_t>(dev_a);
-    task_args[1] = reinterpret_cast<uint64_t>(dev_b);
-    task_args[2] = reinterpret_cast<uint64_t>(dev_c);
-    task_args[3] = SIZE;
-
-    // Add task (func_id=0, core_type=1 for AIV)
-    int t0 = runtime->add_task(task_args, 4, 0, 1);
-    std::cout << "Added task " << t0 << ": {self.get_name()}\\n";
-
-    std::cout << "Created runtime with " << runtime->get_task_count() << " tasks\\n";
-    return 0;
-}}
-
-}}  // extern "C"
-'''
-
-    def compute_expected(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        return {"c": inputs["a"] + inputs["b"]}
+    def compute_expected(self, tensors, params=None):
+        tensors["c"][:] = tensors["a"] + tensors["b"]
 
 
 class TestTileMul(PTOTestCase):
@@ -125,87 +91,113 @@ class TestTileMul(PTOTestCase):
 
     def define_tensors(self) -> List[TensorSpec]:
         return [
-            TensorSpec("a", [self.rows, self.cols], DataType.FP32, init_value=2.0),
-            TensorSpec("b", [self.rows, self.cols], DataType.FP32, init_value=3.0),
+            # 方式1: 使用 Callable 生成随机数据（每次运行不同）
+            TensorSpec("a", [self.rows, self.cols], DataType.FP32,
+                      init_value=lambda shape: np.random.randn(*shape)),
+            # 方式2: 使用标量值（推荐 - 简单且可序列化）
+            TensorSpec("b", [self.rows, self.cols], DataType.FP32,
+                      init_value=3.0),
+            # 其他方式见 TestCustomArrayInit 类的示例：
+            # - 小数组可以直接用 np.array([[...]])
+            # - 单位矩阵用 np.eye(n)
+            # - 对角矩阵用 np.diag([...])
+            # 输出张量: 自动零初始化
             TensorSpec("c", [self.rows, self.cols], DataType.FP32, is_output=True),
         ]
 
     def get_program(self) -> Any:
         import pypto.language as pl
 
-        rows, cols = self.rows, self.cols
-
         @pl.program
         class TileMulProgram:
             @pl.function
             def tile_mul(
                 self,
-                a: pl.Tensor[[rows, cols], pl.FP32],
-                b: pl.Tensor[[rows, cols], pl.FP32],
-                c: pl.Tensor[[rows, cols], pl.FP32],
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                c: pl.Tensor[[128, 128], pl.FP32],
             ):
-                tile_a = pl.op.block.load(a, 0, 0, rows, cols)
-                tile_b = pl.op.block.load(b, 0, 0, rows, cols)
+                tile_a = pl.op.block.load(a, 0, 0, 128, 128)
+                tile_b = pl.op.block.load(b, 0, 0, 128, 128)
                 tile_c = pl.op.block.mul(tile_a, tile_b)
-                pl.op.block.store(tile_c, 0, 0, rows, cols, c)
+                pl.op.block.store(tile_c, 0, 0, 128, 128, c)
 
         return TileMulProgram
 
-    def get_orchestration(self) -> str:
-        return f'''
-#include "runtime.h"
-#include <iostream>
+    # NOTE: get_orchestration() is NOT overridden - auto-generated!
 
-extern "C" {{
+    def compute_expected(self, tensors, params=None):
+        # 多步计算
+        temp1 = np.exp(tensors["a"])
+        temp2 = np.log(tensors["b"] + 1e-8)
+        temp3 = np.maximum(temp1 * temp2, 0)
 
-int build_test_graph(Runtime* runtime, uint64_t* args, int arg_count) {{
-    void* host_a = reinterpret_cast<void*>(args[0]);
-    void* host_b = reinterpret_cast<void*>(args[1]);
-    void* host_c = reinterpret_cast<void*>(args[2]);
-    size_t size_a = static_cast<size_t>(args[3]);
-    size_t size_b = static_cast<size_t>(args[4]);
-    size_t size_c = static_cast<size_t>(args[5]);
-    int SIZE = static_cast<int>(args[6]);
+        # 使用各种 NumPy 函数
+        result = np.sqrt(temp3 + tensors["a"]**2)  # 注意：这里改用tensors["a"]因为只有a,b,c三个tensor
+        result = np.clip(result, -100, 100)
 
-    void* dev_a = runtime->host_api.device_malloc(size_a);
-    void* dev_b = runtime->host_api.device_malloc(size_b);
-    void* dev_c = runtime->host_api.device_malloc(size_c);
+        # 条件逻辑
+        mask = tensors["a"] > 0
+        result = np.where(mask, result, -result)
 
-    runtime->host_api.copy_to_device(dev_a, host_a, size_a);
-    runtime->host_api.copy_to_device(dev_b, host_b, size_b);
-    runtime->record_tensor_pair(host_c, dev_c, size_c);
+        tensors["c"][:] = result
 
-    uint64_t task_args[4];
-    task_args[0] = reinterpret_cast<uint64_t>(dev_a);
-    task_args[1] = reinterpret_cast<uint64_t>(dev_b);
-    task_args[2] = reinterpret_cast<uint64_t>(dev_c);
-    task_args[3] = SIZE;
 
-    runtime->add_task(task_args, 4, 0, 1);
-    return 0;
-}}
+class TestTileAddWithPTOAS(TestTileAdd):
+    """Test tile add with PTOAS optimization strategy.
 
-}}
-'''
+    This demonstrates how to use a custom optimization strategy.
+    """
 
-    def compute_expected(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        return {"c": inputs["a"] * inputs["b"]}
+    def get_strategy(self):
+        from pypto.ir.pass_manager import OptimizationStrategy
+        return OptimizationStrategy.PTOAS
 
+    def get_name(self) -> str:
+        return f"tile_add_ptoas_{self.rows}x{self.cols}"
+
+
+class TestCustomArrayInit(PTOTestCase):
+    """Test case demonstrating custom array initialization patterns."""
+
+    def get_name(self) -> str:
+        return "custom_array_init"
+
+    def define_tensors(self) -> List[TensorSpec]:
+        return [
+            # 小数组: 自定义值（会被序列化）
+            TensorSpec("small", [3, 3], DataType.FP32,
+                      init_value=np.array([[1, 2, 3],
+                                          [4, 5, 6],
+                                          [7, 8, 9]], dtype=np.float32)),
+            # 单位矩阵
+            TensorSpec("identity", [4, 4], DataType.FP32,
+                      init_value=np.eye(4, dtype=np.float32)),
+            # 常数数组（会被优化为 np.full）
+            TensorSpec("constant", [5, 5], DataType.FP32,
+                      init_value=np.ones((5, 5)) * 3.14),
+            # 对角矩阵（小数组会序列化）
+            TensorSpec("diagonal", [3, 3], DataType.FP32,
+                      init_value=np.diag([1, 2, 3]).astype(np.float32)),
+            # 输出
+            TensorSpec("out", [3, 3], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        # Placeholder - 这个测试只是为了演示数组初始化
+        return None
+
+    def compute_expected(self, tensors, params=None):
+        # 简单示例: 将 small 数组复制到输出
+        tensors["out"][:] = tensors["small"][:3, :3]
+
+
+# =============================================================================
+# pytest test functions
+# =============================================================================
 
 class TestElementwiseOperations:
     """Test suite for elementwise operations."""
-
-    def test_tile_add_basic(self, test_runner):
-        """Test basic tile addition."""
-        test_case = TestTileAdd(rows=128, cols=128)
-        result = test_runner.run(test_case)
-        assert result.passed, f"Test failed: {result.error}"
-
-    def test_tile_mul_basic(self, test_runner):
-        """Test basic tile multiplication."""
-        test_case = TestTileMul(rows=128, cols=128)
-        result = test_runner.run(test_case)
-        assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("rows,cols", [(64, 64), (128, 128)])
     def test_tile_add_shapes(self, test_runner, rows, cols):
@@ -213,3 +205,16 @@ class TestElementwiseOperations:
         test_case = TestTileAdd(rows=rows, cols=cols)
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed for {rows}x{cols}: {result.error}"
+
+    @pytest.mark.parametrize("rows,cols", [(64, 64), (128, 128)])
+    def test_tile_mul_shapes(self, test_runner, rows, cols):
+        """Test tile multiplication with various shapes."""
+        test_case = TestTileMul(rows=rows, cols=cols)
+        result = test_runner.run(test_case)
+        assert result.passed, f"Test failed for {rows}x{cols}: {result.error}"
+
+    def test_tile_add_ptoas_strategy(self, test_runner):
+        """Test tile addition with PTOAS optimization strategy."""
+        test_case = TestTileAddWithPTOAS(rows=128, cols=128)
+        result = test_runner.run(test_case)
+        assert result.passed, f"Test failed: {result.error}"
