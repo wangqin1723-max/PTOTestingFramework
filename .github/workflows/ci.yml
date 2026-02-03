@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04]
-        python-version: ['3.9', '3.10']  # TODO: Re-enable 3.11 after fixing PyPTO TensorType API compatibility
+        python-version: ['3.10']  # TODO: Re-enable 3.11 after fixing PyPTO TensorType API compatibility
 
     steps:
       - name: Checkout repository with submodules
