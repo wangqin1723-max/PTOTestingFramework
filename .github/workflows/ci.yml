@@ -19,11 +19,47 @@ jobs:
         python-version: ['3.10']  # TODO: Re-enable 3.11 after fixing PyPTO TensorType API compatibility
 
     steps:
+      - name: Checkout (PR merge ref) without submodules
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+
       - name: Checkout repository with submodules
+        if: ${{ github.event_name != 'pull_request' }}
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Force submodule pointers to base branch
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+
+          # Take the base branch's submodule pointers (gitlinks) and force them onto the workspace
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+
+          # Use the base branch's .gitmodules (prevents PR from changing URLs/paths)
+          git checkout "$BASE_SHA" -- .gitmodules || true
+          git submodule sync --recursive || true
+
+          # Reset each submodule gitlink to the commit recorded on the base branch
+          git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}' | while read -r p; do
+            if [ -z "$p" ]; then
+              continue
+            fi
+            echo "Forcing submodule pointer for $p to base"
+            git checkout "$BASE_SHA" -- "$p" || true
+          done
+
+      - name: Update submodules (use base pointers)
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init --force --recursive
+          git submodule status --recursive
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
