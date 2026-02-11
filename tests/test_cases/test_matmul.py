@@ -42,13 +42,13 @@ class TestMatmul(PTOTestCase):
                 b: pl.Tensor[[64, 64], pl.FP32],
                 c: pl.Tensor[[64, 64], pl.FP32],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
-                tile_a_l1 = pl.op.block.load(a, 0, 0, 64, 64, target_memory=2)
-                tile_b_l1 = pl.op.block.load(b, 0, 0, 64, 64, target_memory=2)
+                tile_a_l1 = pl.op.block.load(a, [0, 0], [64, 64], target_memory=2)
+                tile_b_l1 = pl.op.block.load(b, [0, 0], [64, 64], target_memory=2)
                 tile_a_l0a = pl.op.block.move(tile_a_l1, target_memory=3)
                 tile_b_l0b = pl.op.block.move(tile_b_l1, target_memory=4)
                 tile_c_l0c = pl.op.block.matmul(tile_a_l0a, tile_b_l0b)
                 # store can support l0c -> GM directly
-                out_c = pl.op.block.l0c_store(tile_c_l0c, 0, 0, 64, 64, c)
+                out_c = pl.op.block.l0c_store(tile_c_l0c, [0, 0], [64, 64], c)
                 return out_c
 
             @pl.function(type=pl.FunctionType.Orchestration)
